@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# Build, sign, and publish an xtool project for OTA install via tailnet.
+# Usage: ios-ota [--testflight|--both] [project-dir]     (defaults to current directory)
+#
+# --testflight signs with the DISTRIBUTION identity + App Store profiles (no device list,
+# get-task-allow off) and uploads to App Store Connect instead of publishing an OTA page.
+# --both signs the one compile twice: publishes the OTA page, then uploads the TestFlight copy.
+# Same binary and build number; the two ipas differ only in signing, profiles and APNs environment.
+# One-time deps: rcodesign, `provision.py identity` (writes ~/.local/share/ios-ota/{key.pem,cert.pem}),
+# tailscale serve. See the README.
+set -euo pipefail
+
+# The phone may be plugged into any of several machines (see `ios-host`). Resolve which one
+# actually has it, so USB install/debug works without hand-exporting an address.
+if [ -z "${USBMUXD_SOCKET_ADDRESS:-}" ]; then
+  _H=$(ios-host 2>/dev/null || true)
+  if [ -n "$_H" ]; then export USBMUXD_SOCKET_ADDRESS="$_H"; fi
+fi
+
+MODE=dev
+case "${1:-}" in --testflight) MODE=testflight; shift ;; --both) MODE=both; shift ;; esac
+
+PROJ=$(realpath "${1:-.}")
+STORE=~/.local/share/ios-ota
+WWW=$STORE/www
+[ -f "$PROJ/xtool.yml" ] || { echo "error: $PROJ is not an xtool project (no xtool.yml)"; exit 1; }
+
+BUNDLE=$(grep -E '^bundleID:' "$PROJ/xtool.yml" | awk '{print $2}')
+PREFIX=$(python3 -c "import json;print('XTL-'+json.load(open('$HOME/.config/xtool/data/XTLAuthToken'))['appStoreConnect']['_0']['issuerID'][:8].upper())")
+XTLID="$PREFIX.$BUNDLE"   # must match xtool's device-install ID so OTA updates preserve app data
+
+echo "==> Building $BUNDLE"
+. ~/.local/share/swiftly/env.sh
+(cd "$PROJ" && xtool dev build --ipa >/dev/null)
+IPA=$(ls "$PROJ"/xtool/*.ipa)
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+bsdtar -xf "$IPA" -C "$WORK"
+APP=$(ls -d "$WORK"/Payload/*.app)
+APPNAME=$(basename "$APP" .app)
+APP_ORIG_BID=$(python3 -c "import plistlib;print(plistlib.load(open('$APP/Info.plist','rb'))['CFBundleIdentifier'])")
+
+# Extract the Entitlements dict out of a .mobileprovision into a plist file, optionally
+# merging a per-project ios-ota.entitlements.json (3rd arg). keychain-access-groups are
+# APPENDED (the profile's TEAMID.* wildcard authorizes concrete groups, but iOS only matches
+# the literal group named in the signed entitlement — Xcode bakes it in; we do the same so an
+# appex can share a keychain group with the app). Other keys are set outright.
+extract_ent() { python3 - "$1" "$2" "${3:-}" <<'EOF'
+import plistlib, sys, json, os
+prof, out = sys.argv[1], sys.argv[2]
+cfg = sys.argv[3] if len(sys.argv) > 3 else ''
+raw = open(prof, 'rb').read()
+plist = raw[raw.find(b'<?xml'):raw.find(b'</plist>') + 8]
+ent = plistlib.loads(plist)['Entitlements']
+if cfg and os.path.exists(cfg):
+    for k, v in json.load(open(cfg)).items():
+        if v is None:                       # null → REMOVE the key (e.g. drop an unwanted profile entitlement)
+            ent.pop(k, None)
+        elif k == 'keychain-access-groups' and isinstance(v, list):
+            cur = ent.get(k, [])
+            ent[k] = cur + [g for g in v if g not in cur]
+        else:
+            ent[k] = v
+plistlib.dump(ent, open(out, 'wb'))
+EOF
+}
+
+# App Store validation rejects a build whose Info.plist lacks the toolchain-provenance keys Xcode
+# normally writes (xtool writes none). We really do compile against Apple's iOS SDK, so declare it:
+# values come from the SDK itself (SystemVersion.plist) and the Xcode 26.6 that shipped it.
+DT_SDK=iphoneos26.5 DT_SDK_BUILD=23F81a DT_XCODE=2660 DT_XCODE_BUILD=17F113 DT_MACOS=25F84
+DT_WATCH_SDK=26.5 DT_WATCH_SDK_BUILD=23T570
+add_dt() { python3 - "$1" "$DT_SDK" "$DT_SDK_BUILD" "$DT_XCODE" "$DT_XCODE_BUILD" "$DT_MACOS" "$DT_WATCH_SDK" "$DT_WATCH_SDK_BUILD" <<'EOF'
+import plistlib, sys
+path, sdk, sdk_build, xcode, xcode_build, macos, WATCH_SDK, WATCH_SDK_BUILD = sys.argv[1:]
+d = plistlib.load(open(path, 'rb'))
+# A watchOS bundle must declare the watch platform; saying iphoneos there fails validation
+# with "Invalid Info.plist value ... DTPlatformName".
+watch = d.get("CFBundleSupportedPlatforms") == ["WatchOS"] or d.get("WKApplication") is True
+if watch:
+    sdk, sdk_build = "watchos" + WATCH_SDK, WATCH_SDK_BUILD
+d.update({"DTPlatformName": "watchos" if watch else "iphoneos",
+          "DTPlatformVersion": sdk.removeprefix("watchos" if watch else "iphoneos"),
+          "DTSDKName": sdk, "DTSDKBuild": sdk_build, "DTPlatformBuild": sdk_build,
+          "DTXcode": xcode, "DTXcodeBuild": xcode_build, "BuildMachineOSBuild": macos,
+          "DTCompiler": "com.apple.compilers.llvm.clang.1_0"})
+# A 64-bit-only binary must advertise arm64; Apple rejects extensions that omit it.
+if not watch:
+    d.setdefault("UIRequiredDeviceCapabilities", ["arm64"])
+plistlib.dump(d, open(path, 'wb'))
+EOF
+}
+
+# A distribution build must not ship get-task-allow: it is what lets a debugger attach, and App
+# Store validation rejects it. Apple's App Store profiles already say false; enforce it anyway.
+strip_dev_ent() { python3 - "$1" <<'EOF'
+import plistlib, sys
+d = plistlib.load(open(sys.argv[1], 'rb'))
+d.pop("get-task-allow", None)
+plistlib.dump(d, open(sys.argv[1], 'wb'))
+EOF
+}
+
+echo "==> Rewriting bundle ID + bumping build number"
+BUILD=$(date +%Y%m%d%H%M%S)
+python3 - "$APP/Info.plist" "$XTLID" "$BUILD" "$PROJ/ios-ota.infoplist.json" <<'EOF'
+import plistlib, sys, json, os
+p, bid, build, extra = sys.argv[1:]
+d = plistlib.load(open(p, 'rb'))
+d['CFBundleIdentifier'] = bid
+d['CFBundleVersion'] = build
+# Restore Info.plist keys that xtool's infoPlist merge drops (arrays of dicts, etc.).
+if os.path.exists(extra):
+    d.update(json.load(open(extra)))
+plistlib.dump(d, open(p, 'wb'))
+EOF
+
+add_dt "$APP/Info.plist"
+
+# SwiftPM resource bundles (<Pkg>_<Target>.bundle) come out of xtool with no Info.plist. Xcode
+# always writes one, and App Store processing sat in PROCESSING indefinitely on a build without it.
+for RB in "$APP"/*.bundle; do
+  [ -d "$RB" ] && [ ! -f "$RB/Info.plist" ] || continue
+  python3 - "$RB" <<'EOF'
+import plistlib, sys, os
+rb = sys.argv[1]; name = os.path.basename(rb)[:-len('.bundle')]
+plistlib.dump({'CFBundleDevelopmentRegion': 'en', 'CFBundleIdentifier': name.replace('_', '-') + '-resources',
+               'CFBundleInfoDictionaryVersion': '6.0', 'CFBundleName': name, 'CFBundlePackageType': 'BNDL',
+               'CFBundleSupportedPlatforms': ['iPhoneOS']}, open(rb + '/Info.plist', 'wb'))
+EOF
+  add_dt "$RB/Info.plist"
+  echo "    resource bundle Info.plist -> ${RB##*/}"
+done
+
+echo "==> Generating App Intents metadata"
+xtool-gen-appintents "$PROJ" "$APP" "$APPNAME" "$XTLID" || true
+
+# Optional watch app: a `<project>/ios-ota.watch` file naming the watch SwiftPM product.
+if [ -f "$PROJ/ios-ota.watch" ]; then
+  WP=$(tr -d '[:space:]' < "$PROJ/ios-ota.watch")
+  echo "==> Embedding watch app $WP"
+  xtool-embed-watch "$PROJ" "$WP" "$APP" "$APP_ORIG_BID" || echo "    watch embed failed (continuing without it)"
+fi
+
+echo "==> Rewriting embedded extensions + watch app"
+# Each nested bundle (.appex, or Watch/*.app) needs its OWN child bundle ID, profile, entitlements.
+# rcodesign signs nested bundles automatically; we scope per-bundle entitlements to their path.
+# Apple requires an app EXTENSION's version to match the containing app, so every nested bundle's
+# CFBundleVersion/ShortVersionString is synced to the app's — a mismatch makes iOS refuse to load
+# the extension (Live Activities / widgets silently stop working).
+APP_SHORTVER=$(python3 -c "import plistlib;print(plistlib.load(open('$APP/Info.plist','rb')).get('CFBundleShortVersionString','1.0'))")
+NESTED=()   # REL child-bundle-ID pairs, provisioned per signing mode in sign_as
+shopt -s nullglob
+# Inner-first: a watch app's own PlugIns (the watch-face complication) before the watch app.
+for AX in "$APP"/PlugIns/*.appex "$APP"/Extensions/*.appex \
+          "$APP"/Watch/*.app/PlugIns/*.appex "$APP"/Watch/*.app; do
+  [ -d "$AX" ] || continue
+  REL=${AX#"$APP"/}          # e.g. PlugIns/LiveTestWidget.appex
+  AXNEW=$(python3 - "$AX/Info.plist" "$APP_ORIG_BID" "$XTLID" "$BUILD" "$APP_SHORTVER" <<'EOF'
+import plistlib, sys
+info, app_orig, xtlid, build, shortver = sys.argv[1:]
+d = plistlib.load(open(info, 'rb'))
+orig = d['CFBundleIdentifier']
+# child ID = new app ID + the bundle's suffix (preserves Apple's parent-prefix rule)
+suffix = orig[len(app_orig):] if orig.startswith(app_orig) else '.' + orig.rsplit('.', 1)[-1]
+d['CFBundleIdentifier'] = xtlid + suffix
+# match the app's version so iOS accepts the extension
+d['CFBundleVersion'] = build
+d['CFBundleShortVersionString'] = shortver
+# a watch app points back at the (now-rewritten) companion iOS app
+if 'WKCompanionAppBundleIdentifier' in d:
+    d['WKCompanionAppBundleIdentifier'] = xtlid
+plistlib.dump(d, open(info, 'wb'))
+print(xtlid + suffix)
+EOF
+)
+  add_dt "$AX/Info.plist"
+  NESTED+=("$REL" "$AXNEW")
+  echo "    $REL -> $AXNEW"
+done
+shopt -u nullglob
+
+# Optional SiriKit example phrases: a <project>/AppIntentVocabulary.plist goes into the app's
+# dev-region .lproj so a supported intent has example phrases (Apple flags ITMS-90626 "Invalid Siri
+# Support" otherwise). Must land before signing so it's inside the signature.
+if [ -f "$PROJ/AppIntentVocabulary.plist" ]; then
+  REGION=$(python3 -c "import plistlib;print(plistlib.load(open('$APP/Info.plist','rb')).get('CFBundleDevelopmentRegion','en'))")
+  mkdir -p "$APP/$REGION.lproj"
+  cp "$PROJ/AppIntentVocabulary.plist" "$APP/$REGION.lproj/AppIntentVocabulary.plist"
+  echo "==> Embedded AppIntentVocabulary.plist ($REGION.lproj)"
+fi
+
+# Sign a copy of the prepared app for one mode and package it as $WORK/<mode>.ipa. Distribution
+# builds use a separate cert, profile set and provision.py subcommand.
+sign_as() {
+  local m=$1 key cert suffix prov
+  if [ "$m" = testflight ]; then key=dist-key.pem cert=dist-cert.pem suffix=.appstore prov=dist-profile
+  else key=key.pem cert=cert.pem suffix="" prov=profile; fi
+  echo "==> Signing for $m"
+  rm -rf "${WORK:?}/$m" && mkdir "$WORK/$m" && cp -a "$WORK/Payload" "$WORK/$m/"
+  local APP=$WORK/$m/Payload/$APPNAME.app SCOPE_ARGS=() i REL AXPROF ENT
+
+  # APNs tokens issued to TestFlight/App Store builds belong to production; dev/OTA
+  # profiles use the sandbox endpoint. The app reads this signed Info.plist value.
+  python3 - "$APP/Info.plist" "$m" <<'EOF'
+import plistlib, sys
+p, m = sys.argv[1:]
+d = plistlib.load(open(p, 'rb'))
+d['APNSEnvironment'] = 'production' if m == 'testflight' else 'sandbox'
+plistlib.dump(d, open(p, 'wb'))
+EOF
+
+  for ((i = 0; i < ${#NESTED[@]}; i += 2)); do
+    REL=${NESTED[i]}
+    AXPROF=$STORE/profiles/${NESTED[i+1]}$suffix.mobileprovision
+    ENT=$WORK/$m/ent-${REL//\//_}.plist
+    [ -f "$AXPROF" ] || provision.py $prov "${NESTED[i+1]}"
+    cp "$AXPROF" "$APP/$REL/embedded.mobileprovision"
+    extract_ent "$AXPROF" "$ENT" "$PROJ/ios-ota.entitlements.json"
+    if [ "$m" = testflight ]; then strip_dev_ent "$ENT"; fi
+    SCOPE_ARGS+=(--entitlements-xml-file "$REL:$ENT")
+  done
+
+  # App Store validation requires icons from a COMPILED asset catalog plus a top-level
+  # CFBundleIconName; loose PNGs are rejected. actool is macOS-only, so `ios-appicon` builds
+  # Assets.car on a runner and caches it here.
+  if [ "$m" = testflight ]; then
+    ICON_NAME=$(basename "$PROJ"); [ "$ICON_NAME" = ios ] && ICON_NAME=$(basename "$(dirname "$PROJ")")
+    ICONS=$STORE/appicons/$ICON_NAME/appicon
+    if [ -d "$ICONS" ]; then
+      echo "==> Embedding compiled app icon"
+      cp "$ICONS"/Assets.car "$ICONS"/*.png "$APP/"
+      python3 - "$APP/Info.plist" "$ICONS/partial.plist" <<'EOF'
+import plistlib, sys
+info, partial = sys.argv[1:]
+d = plistlib.load(open(info, 'rb'))
+d.update(plistlib.load(open(partial, 'rb')))
+d['CFBundleIconName'] = 'AppIcon'   # Apple checks the top-level key, not only the nested one
+plistlib.dump(d, open(info, 'wb'))
+EOF
+    else
+      echo "    !! no compiled icon — run: ios-appicon $PROJ" >&2
+    fi
+  fi
+
+  local PROFILE=$STORE/profiles/$XTLID$suffix.mobileprovision
+  [ -f "$PROFILE" ] || provision.py $prov "$XTLID"
+  cp "$PROFILE" "$APP/embedded.mobileprovision"
+  extract_ent "$PROFILE" "$WORK/$m/ent.plist" "$PROJ/ios-ota.entitlements.json"
+  if [ "$m" = testflight ]; then strip_dev_ent "$WORK/$m/ent.plist"; fi
+  # main entitlements apply to the app; SCOPE_ARGS override per-appex. rcodesign signs inner-first.
+  rcodesign sign --pem-file $STORE/$key --pem-file $STORE/$cert \
+    --entitlements-xml-file "$WORK/$m/ent.plist" "${SCOPE_ARGS[@]}" "$APP" >/dev/null
+  (cd "$WORK/$m" && zip -qr "../$m.ipa" Payload)
+}
+
+# Upload last: it waits on a GitHub runner, and the install page shouldn't wait behind it.
+upload_tf() {
+  IPA_OUT=$STORE/testflight/$APPNAME.ipa
+  mkdir -p "$(dirname "$IPA_OUT")"
+  mv "$WORK/testflight.ipa" "$IPA_OUT"
+  echo "==> Uploading to App Store Connect"
+  ios-upload "$IPA_OUT"
+}
+
+if [ "$MODE" != dev ]; then sign_as testflight; fi
+if [ "$MODE" = testflight ]; then upload_tf; exit; fi
+sign_as dev
+
+echo "==> Publishing OTA"
+OUT=$WWW/$APPNAME
+mkdir -p "$OUT"
+mv "$WORK/dev.ipa" "$OUT/$APPNAME.ipa"
+
+# Manifest needs display-image/full-size-image, not just software-package: some iOS versions
+# silently drop the whole install (no prompt, no error) if they can't build the confirm-sheet
+# icon, even though the manifest itself fetches fine.
+if [ -f "$PROJ/Icon.png" ]; then
+  python3 - "$PROJ/Icon.png" "$OUT/display-icon.png" "$OUT/full-size-icon.png" <<'EOF'
+import sys
+from PIL import Image
+src, small, big = sys.argv[1:]
+im = Image.open(src).convert("RGBA")
+if im.size != (1024, 1024): im = im.resize((1024, 1024), Image.LANCZOS)
+edge = im.getpixel((im.width // 2, 8))[:3]
+flat = Image.new("RGB", im.size, edge)
+flat.paste(im, (0, 0), im)
+flat.save(big, format="PNG")
+flat.resize((57, 57), Image.LANCZOS).save(small, format="PNG")
+EOF
+fi
+
+HOST=$(tailscale status --json | python3 -c "import json,sys;print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))")
+BASE="https://$HOST/$APPNAME"
+VERSION=$(python3 -c "import plistlib;print(plistlib.load(open('$APP/Info.plist','rb')).get('CFBundleShortVersionString','1.0'))")
+
+python3 - "$OUT/manifest.plist" "$BASE/$APPNAME.ipa" "$XTLID" "$BUILD" "$APPNAME" "$BASE" <<'EOF'
+import plistlib, sys, pathlib
+out, url, bid, ver, title, base = sys.argv[1:]
+assets = [{'kind': 'software-package', 'url': url}]
+if (pathlib.Path(out).parent / 'display-icon.png').exists():
+    assets.append({'kind': 'display-image', 'url': f'{base}/display-icon.png'})
+    assets.append({'kind': 'full-size-image', 'url': f'{base}/full-size-icon.png'})
+plistlib.dump({'items': [{'assets': assets,
+                          'metadata': {'bundle-identifier': bid, 'bundle-version': ver,
+                                       'kind': 'software', 'title': title}}]},
+              open(out, 'wb'), fmt=plistlib.FMT_XML)
+EOF
+
+# The nested manifest URL's own "?t=" must be percent-encoded inside the outer
+# url= param - an unescaped "?" here made newer iOS versions parse 0 manifest
+# URLs out of the itms-services request (silent no-op, no prompt, no fetch).
+ENCODED_MANIFEST_URL=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BASE/manifest.plist?t=$BUILD")
+ITMS="itms-services://?action=download-manifest&url=$ENCODED_MANIFEST_URL"
+cat > "$OUT/index.html" <<EOF
+<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>$APPNAME</title>
+<body style="font-family:-apple-system,sans-serif;text-align:center;padding-top:4em">
+<h1>$APPNAME</h1><p>build $BUILD</p>
+<p><a style="font-size:1.5em" href="$ITMS">Install / Update</a></p>
+EOF
+
+# ponytail: on-demand python file server on loopback; tailscale proxies to it (file-serving needs root, proxying doesn't).
+# .plist must be served as text/xml or iOS silently ignores the OTA install (http.server defaults it to octet-stream).
+pgrep -f "ios-ota/www" >/dev/null || (nohup python3 -c "import http.server,functools; H=http.server.SimpleHTTPRequestHandler; H.extensions_map['.plist']='text/xml'; http.server.test(HandlerClass=functools.partial(H,directory='$WWW'),port=8377,bind='127.0.0.1')" >/dev/null 2>&1 &)
+tailscale serve status 2>/dev/null | grep -q 8377 || tailscale serve --bg 8377 >/dev/null
+
+echo
+echo "OTA page:  $BASE/"
+echo "(open on the iPhone — it must be on the tailnet)"
+
+# If a device is plugged in, also install the SAME signed ipa in place over USB. Use
+# pymobiledevice3 (installs as-is) — NOT `xtool install`, which re-prefixes the bundle ID and
+# creates a duplicate app. Guarded so it's a no-op when nothing is attached.
+if python3 -c "import json,sys;sys.exit(0 if json.load(sys.stdin) else 1)" < <(pymobiledevice3 usbmux list 2>/dev/null) 2>/dev/null; then
+  echo "==> Device attached — installing in place over USB"
+  pymobiledevice3 apps install "$OUT/$APPNAME.ipa" 2>&1 | tail -1 || echo "   (USB install failed; OTA is still published)"
+fi
+
+if [ "$MODE" = both ]; then upload_tf; fi

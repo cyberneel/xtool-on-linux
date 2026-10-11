@@ -1,0 +1,12 @@
+[Unit]
+Description=Share local usbmuxd (plugged-in iOS devices) to the tailnet on :27015
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:27015,fork,reuseaddr,bind=SHARING_HOST_TAILNET_IP UNIX-CONNECT:/var/run/usbmuxd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Build a watchOS app from an xtool project's watch library and embed it in the iOS .app.
+# The app is COMPILED + linked by Apple's toolchain on a GitHub macOS runner, which also emits
+# the arm64 + arm64_32 slices the App Store requires (arm64e is rejected). Source is sent
+# encrypted as a workflow input. The runner side is ci/watch-link-ci/ in this repo; host it in a
+# repo of your own and name it in WATCH_CI_REPO.
+# Usage: xtool-embed-watch <project-dir> <watch-product> <path-to-iOS.app> <iOS-bundle-id> [deployment]
+set -euo pipefail
+gh() { gh-retry "$@"; } # ride out GitHub API 5xx bursts
+PROJ=$(realpath "$1"); WATCH_PRODUCT=$2; APP=$3; IOS_BID=$4; DEPLOY=${5:-26.0}
+NAME=$WATCH_PRODUCT
+CI_REPO=${WATCH_CI_REPO:?set WATCH_CI_REPO=<owner>/<repo> (your copy of ci/watch-link-ci)}
+
+SRC="$PROJ/Sources/$WATCH_PRODUCT"
+[ -d "$SRC" ] || { echo "no source dir $SRC"; exit 1; }
+
+# Optional watch-face complication: a sibling source dir Sources/<watch product>Complication/.
+# Its existence is the whole switch — no marker file. It links as its own watchOS WidgetKit
+# extension and lands at Watch/<App>.app/PlugIns/<X>.appex.
+# ponytail: `cp` follows symlinks, so a file shared with the watch app can just be symlinked in.
+EXT_SRC="$PROJ/Sources/${WATCH_PRODUCT}Complication"
+EXT_NAME=""
+[ -d "$EXT_SRC" ] && EXT_NAME="${WATCH_PRODUCT}Complication"
+
+echo "==> Building on CI (Apple compiler → arm64 + arm64_32)"
+# Source is encrypted + passed inline as a workflow input — no tailnet round-trip (fast),
+# and the ciphertext is safe even in the public CI repo. Shared symmetric key: watch-src.key.
+# ponytail: ships the watch target's own .swift only; a shared-module dependency would need
+# its sources too. ponytail: inline input suits small apps; huge sources would exceed arg limits.
+KEY=~/.local/share/ios-ota/watch-src.key
+STAGE=$(mktemp -d)
+cp "$SRC"/*.swift "$STAGE/"
+if [ -n "$EXT_NAME" ]; then mkdir -p "$STAGE/ext"; cp "$EXT_SRC"/*.swift "$STAGE/ext/"; fi
+# Watch app icon: build AppIcon.xcassets from the project's own Icon.png so the watch app
+# matches the phone app (CI compiles src/AppIcon.xcassets when present, else its placeholder).
+# watchOS icons must be opaque — Icon.png must have NO alpha channel (RGB, not RGBA).
+if [ -f "$PROJ/Icon.png" ]; then
+  ICONSET="$STAGE/AppIcon.xcassets/AppIcon.appiconset"
+  mkdir -p "$ICONSET"
+  # Flatten first: Apple rejects watch icons with an alpha channel ("Invalid Icon ... contains an
+  # icon file with an alpha channel"), and the project icon is RGBA.
+  ios-appicon --flatten "$PROJ/Icon.png" "$ICONSET/icon.png" >/dev/null
+  printf '{ "info": { "author": "xtool", "version": 1 } }\n' > "$STAGE/AppIcon.xcassets/Contents.json"
+  printf '{ "images": [ { "filename": "icon.png", "idiom": "universal", "platform": "watchos", "size": "1024x1024" } ], "info": { "author": "xtool", "version": 1 } }\n' > "$ICONSET/Contents.json"
+fi
+# Write encrypted base64 to a file (never onto a command line — a >128KB arg hits ARG_MAX),
+# then hand the inputs to gh as JSON via stdin so any icon size works.
+B64=$(mktemp)
+tar czf - -C "$STAGE" . | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:"$KEY" | base64 -w0 > "$B64"
+rm -rf "$STAGE"
+python3 -c "import json,sys; print(json.dumps({'src_b64':open(sys.argv[1]).read(),'product':sys.argv[2],'deployment':sys.argv[3],'ext_product':sys.argv[4]}))" \
+  "$B64" "${NAME}App" "$DEPLOY" "$EXT_NAME" | gh workflow run link.yml --repo "$CI_REPO" --json >/dev/null
+rm -f "$B64"
+sleep 6
+RUN=$(gh run list --repo "$CI_REPO" --workflow link.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+echo "    CI run $RUN — waiting..."
+gh run watch "$RUN" --repo "$CI_REPO" --exit-status >/dev/null
+BINDIR=$(mktemp -d)
+gh run download "$RUN" --repo "$CI_REPO" -n watch-binary -D "$BINDIR"
+BIN="$BINDIR/${NAME}App"
+# App Store validation requires arm64 + arm64_32 for watchOS and rejects arm64e outright.
+# Read the fat header rather than parsing `file`, which calls arm64_32 "64_32-bit armv8".
+check_slices() { python3 - "$1" <<'EOF'
+import struct, sys
+CPU = {0x0100000C: "arm64", 0x0200000C: "arm64_32"}
+data = open(sys.argv[1], "rb").read(4096)
+magic = struct.unpack(">I", data[:4])[0]
+if magic not in (0xCAFEBABE, 0xCAFEBABF):
+    sys.exit(f"watch binary is not a universal binary (magic {magic:#x})")
+n = struct.unpack(">I", data[4:8])[0]
+step = 32 if magic == 0xCAFEBABF else 20
+archs = {CPU.get(struct.unpack(">i", data[8 + i * step:12 + i * step])[0] & 0xFFFFFFFF)
+         for i in range(n)}
+missing = {"arm64", "arm64_32"} - archs
+if missing:
+    sys.exit(f"watch binary is missing {sorted(missing)}; has {sorted(a for a in archs if a)}")
+print(f"    {sys.argv[1].rsplit('/', 1)[-1]} slices: {sorted(a for a in archs if a)}")
+EOF
+}
+check_slices "$BIN"
+if [ -n "$EXT_NAME" ]; then check_slices "$BINDIR/$EXT_NAME"; fi
+
+echo "==> Assembling Watch/$NAME.app"
+WATCH_BID="$IOS_BID.watchkitapp"
+WAPP="$APP/Watch/$NAME.app"
+rm -rf "$WAPP"; mkdir -p "$WAPP"
+cp "$BIN" "$WAPP/$NAME"
+[ -f "$BINDIR/Assets.car" ] && cp "$BINDIR/Assets.car" "$WAPP/"
+ICONINFO="$BINDIR/icon-info.plist"
+# Optional: newline-separated ActivityAttributes type names whose Live Activity tap should launch
+# the watch app (else watchOS shows "open on iPhone"). Empty/missing → key omitted (an EMPTY array
+# does NOT mean "all"; watchOS needs the specific type names).
+ACTIVITIES_FILE="$PROJ/ios-ota.watch.activities"
+# Optional per-project extra Info.plist keys (e.g. privacy usage strings the watch target needs
+# for mic/speech). JSON object, merged last so it can add — but not clobber — the base keys above.
+INFOPLIST_JSON="$PROJ/ios-ota.watch.infoplist.json"
+python3 - "$WAPP/Info.plist" "$WATCH_BID" "$NAME" "$IOS_BID" "$DEPLOY" "$ICONINFO" "$ACTIVITIES_FILE" "$INFOPLIST_JSON" <<'EOF'
+import plistlib, sys, os, json
+out, bid, name, companion, deploy, iconinfo, activities_file, infoplist_json = sys.argv[1:]
+d = {
+    "CFBundleIdentifier": bid, "CFBundleName": name, "CFBundleDisplayName": name,
+    "CFBundleExecutable": name, "CFBundlePackageType": "APPL",
+    "CFBundleInfoDictionaryVersion": "6.0", "CFBundleShortVersionString": "1.0.0",
+    "CFBundleVersion": "1", "CFBundleSupportedPlatforms": ["WatchOS"],
+    "MinimumOSVersion": deploy, "UIDeviceFamily": [4], "DTPlatformName": "watchos",
+    "WKApplication": True, "WKWatchOnly": False,
+    "WKCompanionAppBundleIdentifier": companion,
+}
+if os.path.exists(activities_file):
+    types = [ln.strip() for ln in open(activities_file) if ln.strip() and not ln.startswith("#")]
+    if types: d["WKSupportsLiveActivityLaunchAttributeTypes"] = types
+if os.path.exists(iconinfo):
+    try: d.update(plistlib.load(open(iconinfo, "rb")))
+    except Exception: pass
+if os.path.exists(infoplist_json):
+    try: d.update(json.load(open(infoplist_json)))
+    except Exception: pass
+plistlib.dump(d, open(out, "wb"))
+EOF
+
+if [ -n "$EXT_NAME" ]; then
+  echo "==> Embedding complication $EXT_NAME.appex"
+  AX="$WAPP/PlugIns/$EXT_NAME.appex"
+  mkdir -p "$AX"
+  cp "$BINDIR/$EXT_NAME" "$AX/$EXT_NAME"
+  # ios-ota rewrites this id (stripping the iOS app's prefix) and syncs the version to the app's.
+  # The suffix is "complications", PLURAL, on purpose: Apple's App ID registry treats the exact
+  # token `complication` as reserved, so POST /bundleIds 409s with the misleading "An App ID with
+  # Identifier '...' is not available" even though nothing of that name exists. Verified 2026-09-14
+  # that only the token is blocked — the same id with any other final segment registers fine, at
+  # the same length and the same .watchkitapp.* nesting. Do not "fix" this back to the singular.
+  python3 - "$AX/Info.plist" "$WATCH_BID.complications" "$EXT_NAME" "$DEPLOY" <<'EOF'
+import plistlib, sys
+out, bid, name, deploy = sys.argv[1:]
+plistlib.dump({
+    "CFBundleIdentifier": bid, "CFBundleName": name, "CFBundleDisplayName": name,
+    "CFBundleExecutable": name, "CFBundlePackageType": "XPC!",
+    "CFBundleInfoDictionaryVersion": "6.0", "CFBundleShortVersionString": "1.0.0",
+    "CFBundleVersion": "1", "CFBundleSupportedPlatforms": ["WatchOS"],
+    "MinimumOSVersion": deploy, "UIDeviceFamily": [4], "DTPlatformName": "watchos",
+    # SwiftUI's @main WidgetBundle is the entry point, so no NSExtensionPrincipalClass.
+    "NSExtension": {"NSExtensionPointIdentifier": "com.apple.widgetkit-extension"},
+}, open(out, "wb"))
+EOF
+fi
+
+rm -rf "$BINDIR"
+echo "    embedded $WAPP  (arm64+arm64_32 Apple-compiled + icon, bundle id $WATCH_BID, companion $IOS_BID)"

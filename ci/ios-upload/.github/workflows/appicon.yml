@@ -1,0 +1,57 @@
+name: build-appicon
+# Compiles an .xcassets into an Assets.car. Apple requires app icons to come from a compiled
+# asset catalog (plus CFBundleIconName), and `actool` is macOS-only, so the Linux build borrows
+# a runner for this one step. The resulting Assets.car is embedded before signing.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag holding the xcassets zip"
+        required: true
+      asset:
+        description: "Asset filename (zip of Assets.xcassets)"
+        required: true
+      platform:
+        description: "actool platform (iphoneos / watchos)"
+        default: iphoneos
+      min_target:
+        description: "Minimum deployment target"
+        default: "26.0"
+      runner:
+        description: "runs-on label: macos-latest, or xtool-mac (a self-hosted Mac runner, no billed minutes)"
+        default: macos-latest
+
+jobs:
+  appicon:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Fetch the asset catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          find . -mindepth 1 -delete   # a self-hosted workspace persists between runs
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+            --pattern "${{ inputs.asset }}" --dir .
+          unzip -q "${{ inputs.asset }}"
+          find Assets.xcassets -type f | head -20
+
+      - name: actool
+        run: |
+          set -eux
+          mkdir -p out
+          xcrun actool Assets.xcassets \
+            --compile out \
+            --platform "${{ inputs.platform }}" \
+            --minimum-deployment-target "${{ inputs.min_target }}" \
+            --app-icon AppIcon \
+            --output-partial-info-plist out/partial.plist \
+            --output-format human-readable-text
+          ls -la out
+          plutil -p out/partial.plist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appicon
+          path: out/**
+          retention-days: 5

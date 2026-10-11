@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Generate a Metadata.appintents bundle for an xtool project and inject it into a .app.
+# Usage: xtool-gen-appintents <project-dir> <path-to-App.app> <module> <bundle-id>
+# Safe no-op if the project declares no App Intents.
+set -euo pipefail
+# Escape hatch: deploy without App Intents metadata (to isolate metadata-vs-runtime issues).
+[ -n "${XTOOL_SKIP_APPINTENTS:-}" ] && { echo "gen-appintents: skipped (XTOOL_SKIP_APPINTENTS)"; exit 0; }
+GEN=${XTOOL_APPINTENTS_DIR:-$(dirname "$(readlink -f "$0")")/../appintents}
+PROJ=$(realpath "$1"); APP=$2; MODULE=$3; BUNDLE=$4
+
+. ~/.local/share/swiftly/env.sh
+# Side build purely to emit .swiftconstvalues (compiler byproduct describing the source).
+(cd "$PROJ" && swift build --swift-sdk arm64-apple-ios -c debug \
+  -Xswiftc -Xfrontend -Xswiftc -const-gather-protocols-file \
+  -Xswiftc -Xfrontend -Xswiftc "$GEN/appintents-protocols.json" \
+  -Xswiftc -emit-const-values >/dev/null 2>&1) || { echo "gen-appintents: const build failed"; exit 0; }
+
+mapfile -t CV < <(find "$PROJ/.build" -name '*.swiftconstvalues' 2>/dev/null)
+[ ${#CV[@]} -gt 0 ] || { echo "gen-appintents: no const values (no intents?)"; exit 0; }
+
+# Bundle ids that link these intents: the app plus every embedded appex. Each needs its own
+# Metadata.appintents (Xcode emits one per target), and every action must map its mangled type
+# name for BOTH — otherwise an intent defined in a shared module and invoked from a widget /
+# Live Activity button fails with "There is no metadata for <Intent> in <bundle>" and the button
+# silently does nothing.
+EXTIDS=()
+for EXT in "$APP"/PlugIns/*.appex; do
+  [ -d "$EXT" ] || continue
+  # SiriKit (intents-service) extensions don't use App Intents — injecting the app's App Intents
+  # metadata into one makes App Store processing reject the build with "Invalid Siri Support". Skip.
+  [ "$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("NSExtension",{}).get("NSExtensionPointIdentifier",""))' "$EXT/Info.plist")" = com.apple.intents-service ] && continue
+  EID=$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("CFBundleIdentifier",""))' "$EXT/Info.plist")
+  [ -n "$EID" ] || continue
+  EXTIDS+=("$EID")
+  # The appex Info.plist is still un-prefixed here (ios-ota rewrites it at provisioning time),
+  # so also record the id it will actually ship with: <app bundle> + the appex's suffix.
+  BASE=${BUNDLE#XTL-*.}
+  case "$EID" in "$BASE".*) EXTIDS+=("$BUNDLE${EID#$BASE}");; esac
+done
+EXTRA=(); for E in "${EXTIDS[@]}"; do [ -n "$E" ] && EXTRA+=(--extra-bundle-id "$E"); done
+
+# "${EXTRA[@]}" (not :-) so an empty array expands to nothing, not a stray '' arg that
+# argparse would treat as a positional and then reject the real constvalues.
+python3 "$GEN/appintents-gen.py" --module "$MODULE" --bundle-id "$BUNDLE" "${EXTRA[@]}" \
+  --out "$APP/Metadata.appintents" "${CV[@]}"
+
+# Each embedded appex needs its OWN Metadata.appintents, keyed to its own bundle id — Xcode
+# emits one per target. Without it, an intent invoked from a widget / Live Activity button runs
+# in the appex and the system fails the lookup with "There is no metadata for <Intent> in
+# <bundle>", so the button silently does nothing.
+for EXT in "$APP"/PlugIns/*.appex; do
+  [ -d "$EXT" ] || continue
+  # SiriKit (intents-service) extensions don't use App Intents — injecting the app's App Intents
+  # metadata into one makes App Store processing reject the build with "Invalid Siri Support". Skip.
+  [ "$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("NSExtension",{}).get("NSExtensionPointIdentifier",""))' "$EXT/Info.plist")" = com.apple.intents-service ] && continue
+  EXTID=$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("CFBundleIdentifier",""))' "$EXT/Info.plist")
+  [ -n "$EXTID" ] || continue
+  python3 "$GEN/appintents-gen.py" --module "$MODULE" --bundle-id "$EXTID" \
+    --extra-bundle-id "$BUNDLE" --out "$EXT/Metadata.appintents" "${CV[@]}"
+done

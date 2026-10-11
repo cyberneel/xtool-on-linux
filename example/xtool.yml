@@ -1,0 +1,11 @@
+version: 1
+bundleID: com.example.myapp
+displayName: MyApp
+iconPath: Icon.png
+product: MyApp
+infoPath: App-Info.plist
+# Widgets and Live Activities ship as a WidgetKit extension. xtool builds, embeds and signs it.
+extensions:
+  - product: MyAppWidget
+    bundleID: com.example.myapp.Widget
+    infoPath: Widget-Info.plist

@@ -1,0 +1,60 @@
+name: upload-to-appstoreconnect
+# The .ipa is built and distribution-signed on Linux; only the upload needs macOS, because
+# Xcode 26.6 ships no iTMSTransporter or jars -- just `altool`, a macOS Mach-O binary.
+# The build arrives as a release asset in this PRIVATE repo and is deleted again by ios-upload.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag holding the .ipa asset"
+        required: true
+      asset:
+        description: "Asset filename"
+        required: true
+      validate_only:
+        description: "Run --validate-app instead of uploading"
+        default: "false"
+      runner:
+        description: "runs-on label: macos-latest, or xtool-mac (a self-hosted Mac runner, no billed minutes)"
+        default: macos-latest
+
+jobs:
+  upload:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Fetch the signed build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          find . -mindepth 1 -delete   # a self-hosted workspace persists between runs
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+            --pattern "${{ inputs.asset }}" --dir .
+          ls -la "${{ inputs.asset }}"
+
+      - name: Install the App Store Connect API key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -eu
+          # ./private_keys is on altool's search path; keeps the key out of ~ on the self-hosted Mac.
+          mkdir -p private_keys
+          printf '%s' "$ASC_KEY_P8" > private_keys/AuthKey_${ASC_KEY_ID}.p8
+          chmod 600 private_keys/AuthKey_${ASC_KEY_ID}.p8
+
+      - name: altool
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          API_PRIVATE_KEYS_DIR: ${{ github.workspace }}/private_keys
+        run: |
+          set -eux
+          ACTION=--upload-app
+          if [ "${{ inputs.validate_only }}" = "true" ]; then ACTION=--validate-app; fi
+          xcrun altool $ACTION -f "${{ inputs.asset }}" -t ios \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --output-format json
+
+      - name: Remove the key and build
+        if: always()
+        run: rm -rf private_keys "${{ inputs.asset }}"

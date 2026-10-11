@@ -1,0 +1,5 @@
+__pycache__/
+*.pem
+*.p8
+*.mobileprovision
+*.key

@@ -1,0 +1,13 @@
+[Unit]
+Description=usbmuxd bridge to the machine the iPhone is plugged into, over the tailnet
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+# Presents a local /var/run/usbmuxd that forwards to the sharing host's usbmuxd over the tailnet.
+ExecStart=/usr/bin/socat UNIX-LISTEN:/var/run/usbmuxd,fork,mode=666,unlink-early TCP:SHARING_HOST_TAILNET_IP:27015
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

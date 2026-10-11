@@ -1,0 +1,15 @@
+{
+  "CFBundleURLTypes": [
+    {
+      "CFBundleURLName": "com.example.myapp",
+      "CFBundleURLSchemes": ["myapp"]
+    }
+  ],
+  "UIApplicationShortcutItems": [
+    {
+      "UIApplicationShortcutItemType": "compose",
+      "UIApplicationShortcutItemTitle": "New note",
+      "UIApplicationShortcutItemIconType": "UIApplicationShortcutIconTypeCompose"
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Compile an app icon into the Assets.car that App Store validation demands.
+
+Apple requires iOS app icons to come from a *compiled* asset catalog plus a CFBundleIconName key;
+loose PNGs are rejected. `actool` is macOS-only, so the catalog is couriered to a macOS runner (the
+same private repo ios-upload uses) and the resulting Assets.car cached here for ios-ota to embed.
+
+  ios-appicon <project-dir>        # uses <project>/Icon.png, caches Assets.car + partial.plist
+  ios-appicon --flatten <in> <out> # just strip alpha (watch builds need this too)
+Re-run when the icon changes; ios-ota picks the cache up automatically.
+"""
+import json, os, pathlib, shutil, subprocess, sys, tempfile, zipfile
+
+from PIL import Image
+
+STORE = pathlib.Path.home() / ".local/share/ios-ota"
+REPO = os.environ.get("IOS_UPLOAD_REPO", "")  # your copy of ci/ios-upload
+# Same runner pick as ios-upload: a self-hosted Mac runner (label xtool-mac) when online (hosted macOS bills at 10x).
+RUNNER_JQ = ('if any(.runners[]; .status=="online" and any(.labels[]; .name=="xtool-mac")) '
+             'then "xtool-mac" else "macos-latest" end')
+
+
+def flatten(src, dst):
+    """App icons must not carry alpha. The transparent part is the rounded-corner margin, which iOS
+    masks off anyway, so fill it with the icon's own edge colour -- any other colour would show as a
+    fringe if Apple's mask and the artwork disagree."""
+    im = Image.open(src).convert("RGBA")
+    if im.size != (1024, 1024):
+        im = im.resize((1024, 1024), Image.LANCZOS)
+    edge = im.getpixel((im.width // 2, 8))[:3]
+    flat = Image.new("RGB", im.size, edge)
+    flat.paste(im, (0, 0), im)
+    flat.save(dst, format="PNG")
+    return edge
+
+
+def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--flatten":
+        print(f"flattened onto rgb{flatten(sys.argv[2], sys.argv[3])}")
+        return 0
+    if not REPO:
+        sys.exit("ios-appicon: set IOS_UPLOAD_REPO=<owner>/<private repo>")
+    proj = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+    icon = proj / "Icon.png"
+    if not icon.exists():
+        sys.exit(f"ios-appicon: no Icon.png in {proj}")
+    name = proj.parent.name if proj.name == "ios" else proj.name
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        iconset = tmp / "Assets.xcassets/AppIcon.appiconset"
+        iconset.mkdir(parents=True)
+        edge = flatten(icon, iconset / "icon.png")
+        # One 1024 universal image: actool derives every required size from it.
+        (iconset / "Contents.json").write_text(json.dumps({
+            "images": [{"filename": "icon.png", "idiom": "universal",
+                        "platform": "ios", "size": "1024x1024"}],
+            "info": {"author": "xcode", "version": 1}}, indent=2))
+        (tmp / "Assets.xcassets/Contents.json").write_text(
+            json.dumps({"info": {"author": "xcode", "version": 1}}, indent=2))
+        zip_path = tmp / f"{name}-xcassets.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in (tmp / "Assets.xcassets").rglob("*"):
+                if f.is_file():
+                    z.write(f, f.relative_to(tmp))
+        runner = os.environ.get("IOS_UPLOAD_RUNNER") or subprocess.run(
+            ["gh", "api", f"repos/{REPO}/actions/runners", "--jq", RUNNER_JQ],
+            capture_output=True, text=True).stdout.strip() or "macos-latest"
+        print(f"==> icon flattened onto rgb{edge}; compiling on {runner}")
+
+        tag = f"appicon-{name}"
+        run = lambda *a, **k: subprocess.run(a, check=k.pop("check", True), **k)
+        subprocess.run(["gh", "release", "delete", tag, "--repo", REPO, "--yes", "--cleanup-tag"],
+                       capture_output=True)
+        run("gh", "release", "create", tag, str(zip_path), "--repo", REPO,
+            "--title", tag, "--notes", "transient asset-catalog staging", capture_output=True)
+        try:
+            run("gh", "workflow", "run", "appicon.yml", "--repo", REPO,
+                "-f", f"tag={tag}", "-f", f"asset={zip_path.name}", "-f", f"runner={runner}",
+                capture_output=True)
+            subprocess.run(["sleep", "8"])
+            rid = subprocess.run(["gh", "run", "list", "--repo", REPO, "--workflow", "appicon.yml",
+                                  "--limit", "1", "--json", "databaseId", "--jq", ".[0].databaseId"],
+                                 capture_output=True, text=True).stdout.strip()
+            if subprocess.run(["gh", "run", "watch", rid, "--repo", REPO, "--exit-status"],
+                              capture_output=True).returncode:
+                sys.exit(f"ios-appicon: actool failed — https://github.com/{REPO}/actions/runs/{rid}")
+            out = STORE / "appicons" / name
+            shutil.rmtree(out, ignore_errors=True)
+            out.mkdir(parents=True)
+            run("gh", "run", "download", rid, "--repo", REPO, "-D", str(out), capture_output=True)
+        finally:
+            subprocess.run(["gh", "release", "delete", tag, "--repo", REPO, "--yes", "--cleanup-tag"],
+                           capture_output=True)
+
+    car = next((STORE / "appicons" / name).rglob("Assets.car"), None)
+    if not car:
+        sys.exit("ios-appicon: runner produced no Assets.car")
+    print(f"==> {car}  ({car.stat().st_size} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

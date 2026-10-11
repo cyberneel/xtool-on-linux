@@ -1,0 +1,102 @@
+name: appintents-golden
+# Runs Xcode's closed-source, macOS-only `appintentsmetadataprocessor` on a sample App Intent
+# and publishes the resulting Metadata.appintents bundle. That output is the golden reference
+# for the Linux reimplementation (appintents-gen.py), which otherwise has nothing to diff
+# against. Only the sample in golden/ is compiled — no user app code is uploaded here.
+on:
+  workflow_dispatch:
+    inputs:
+      deployment:
+        description: "iOS deployment target"
+        default: "17.0"
+
+jobs:
+  golden:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          ls "$(xcode-select -p)/usr/bin" | grep -i appintents || echo "processor NOT in usr/bin"
+
+      - name: Xcode / SDK facts (DT* Info.plist values for the Linux build)
+        run: |
+          set -eux
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          plutil -p "$SDK/SDKSettings.plist" | grep -iE '"(CanonicalName|Version|ProductBuildVersion)"' || true
+          plutil -p "$(xcode-select -p)/Platforms/iPhoneOS.platform/Info.plist" 2>/dev/null | grep -iE '"(ProductBuildVersion|CFBundleVersion)"' || true
+          echo "XCODE_BUILD=$(xcodebuild -version | awk '/Build version/{print $3}')"
+          echo "XCODE_VER=$(xcodebuild -version | head -1 | awk '{print $2}')"
+          echo "MACOS_BUILD=$(sw_vers -buildVersion)"
+
+      - name: Compile sample, emitting .swiftconstvalues
+        run: |
+          set -eux
+          mkdir -p build out
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          TRIPLE="arm64-apple-ios${{ inputs.deployment }}"
+          # An output-file-map pins where the const-values land. Passing -emit-const-values with
+          # a plain -o silently produces nothing, which is how the first run failed.
+          cat > build/map.json <<'MAP'
+          {
+            "golden/GoldenIntents.swift": {
+              "object": "build/Golden.o",
+              "const-values": "build/Golden.swiftconstvalues"
+            }
+          }
+          MAP
+          # The const-extraction pass is the processor's real input in compile-time mode. The
+          # gather list names the protocols whose conformers get their literals recorded.
+          xcrun --sdk iphoneos swiftc \
+            -target "$TRIPLE" -sdk "$SDK" \
+            -c golden/GoldenIntents.swift \
+            -output-file-map build/map.json \
+            -emit-const-values \
+            -Xfrontend -const-gather-protocols-file -Xfrontend golden/gather.json
+          find . -name '*.swiftconstvalues' -print
+          test -s build/Golden.swiftconstvalues
+
+      - name: Run Apple's appintentsmetadataprocessor
+        run: |
+          set -eux
+          DEV="$(xcode-select -p)"
+          # Not in Developer/usr/bin on Xcode 26.6 — locate it rather than assume.
+          PROC="$(find "$DEV" -name appintentsmetadataprocessor -type f 2>/dev/null | head -1)"
+          test -n "$PROC" || { echo "processor not found under $DEV"; exit 1; }
+          echo "processor: $PROC"
+          echo build/Golden.swiftconstvalues > build/constvals.txt
+          echo golden/GoldenIntents.swift > build/sources.txt
+          mkdir -p "out/Golden.app"
+          "$PROC" \
+            --toolchain-dir "$DEV/Toolchains/XcodeDefault.xctoolchain" \
+            --module-name Golden \
+            --sdk-root "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            --xcode-version "$(xcodebuild -version | awk '/Build version/{print $3}')" \
+            --platform-family iOS \
+            --deployment-target "${{ inputs.deployment }}" \
+            --bundle-identifier com.example.golden \
+            --output "out/Golden.app" \
+            --target-triple "arm64-apple-ios${{ inputs.deployment }}" \
+            --binary-file build/Golden.o \
+            --source-file-list build/sources.txt \
+            --swift-const-vals-list build/constvals.txt \
+            --compile-time-extraction \
+            --force \
+            --force-metadata-output
+          find out -type f -print
+
+      - name: Show the golden actionsdata
+        run: |
+          set -eux
+          F="$(find out -name extract.actionsdata | head -1)"
+          python3 -m json.tool "$F"
+          cp "$(find . -name '*.swiftconstvalues' | head -1)" out/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appintents-golden
+          path: out/**
+          retention-days: 5

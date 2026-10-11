@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Upload a distribution-signed .ipa to App Store Connect.
+#
+# Apple ships no Linux uploader -- Xcode 26.6 contains no iTMSTransporter and no jars, only
+# `altool`, a macOS Mach-O. So the build is couriered through a macOS GitHub runner: attach it as a
+# release asset in a PRIVATE repo, run the workflow there, then delete the release so no signed
+# build lingers on GitHub.
+#
+# Usage: ios-upload <app.ipa> [--validate]      (--validate runs altool --validate-app instead)
+set -euo pipefail
+gh() { gh-retry "$@"; } # ride out GitHub API 5xx bursts
+
+IPA=$(realpath "${1:?usage: ios-upload <app.ipa> [--validate]}")
+VALIDATE=false
+[ "${2:-}" = "--validate" ] && VALIDATE=true
+REPO=${IOS_UPLOAD_REPO:?set IOS_UPLOAD_REPO=<owner>/<private repo> (your copy of ci/ios-upload)}
+
+BUILD=$(python3 -c "
+import plistlib,subprocess,sys,glob,tempfile,os
+d=tempfile.mkdtemp(); subprocess.run(['bsdtar','-xf','$IPA','-C',d,'Payload/*/Info.plist'],check=True)
+p=glob.glob(d+'/Payload/*.app/Info.plist')[0]
+print(plistlib.load(open(p,'rb'))['CFBundleVersion'])")
+TAG="build-$BUILD"
+ASSET=$(basename "$IPA")
+
+# Always clean up the staged binary, even if the upload fails. Set before staging: a create whose
+# 5xx hid a success must not leave the build on GitHub.
+cleanup() { gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+echo "==> Staging $ASSET as $REPO@$TAG"
+gh release create "$TAG" "$IPA" --repo "$REPO" --title "$TAG" \
+  --notes "Transient upload staging; deleted once altool finishes." >/dev/null
+
+# A self-hosted Mac runner (label xtool-mac) when one is online — hosted macOS bills minutes at 10x.
+RUNNER=${IOS_UPLOAD_RUNNER:-$(gh api "repos/$REPO/actions/runners" --jq \
+  'if any(.runners[]; .status=="online" and any(.labels[]; .name=="xtool-mac")) then "xtool-mac" else "macos-latest" end' \
+  2>/dev/null || echo macos-latest)}
+echo "==> Running altool on $RUNNER (validate=$VALIDATE)"
+gh workflow run upload.yml --repo "$REPO" \
+  -f tag="$TAG" -f asset="$ASSET" -f validate_only="$VALIDATE" -f runner="$RUNNER" >/dev/null
+sleep 8
+RUN=$(gh run list --repo "$REPO" --workflow upload.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+echo "    https://github.com/$REPO/actions/runs/$RUN"
+if gh run watch "$RUN" --repo "$REPO" --exit-status >/dev/null 2>&1; then
+  if $VALIDATE; then echo "==> altool validation passed (nothing uploaded)"
+  else echo "==> altool succeeded — the build should appear in TestFlight after processing"; fi
+else
+  echo "==> altool FAILED; relevant output:" >&2
+  gh run view "$RUN" --repo "$REPO" --log-failed 2>/dev/null \
+    | grep -aoE "(ERROR|WARN|ITMS-[0-9]+|product-errors|\"message\" : \"[^\"]*\")[^\"]*" | head -25 >&2
+  # A job GitHub never started (billing, no runner) has no log — its reason is an annotation.
+  gh run view "$RUN" --repo "$REPO" 2>/dev/null | sed -n '/^ANNOTATIONS/,/^$/p' >&2
+  exit 1
+fi

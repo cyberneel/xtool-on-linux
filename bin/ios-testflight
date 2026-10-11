@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# TestFlight build: ios-ota in distribution mode.
+exec ios-ota --testflight "$@"

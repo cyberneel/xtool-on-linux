@@ -1,0 +1,123 @@
+name: link-watch
+# Compiles + links a watchOS app from Swift source using Apple's toolchain (Apple's compiler
+# needs Apple's compiler, not just linker). The source arrives as an ENCRYPTED, base64 input
+# and is decrypted with a shared secret — it's never readable in this public repo, and there's
+# no tailnet round-trip, so the run is fast.
+on:
+  workflow_dispatch:
+    inputs:
+      src_b64:
+        description: "base64(openssl-aes-256-cbc(source tarball)) — encrypted, tiny"
+        required: true
+      product:
+        description: "Executable name to produce"
+        required: true
+      deployment:
+        description: "watchOS deployment target"
+        default: "26.0"
+      ext_product:
+        description: "Optional 2nd executable: a watchOS WidgetKit extension linked from src/ext/ (empty = none)"
+        default: ""
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      SRC_KEY: ${{ secrets.SRC_KEY }}
+    steps:
+      - name: Checkout (for the placeholder app icon)
+        uses: actions/checkout@v4
+      - name: Decrypt source
+        run: |
+          mkdir src
+          printf '%s' "${{ inputs.src_b64 }}" | base64 -d \
+            | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SRC_KEY \
+            | tar xzf - -C src
+          echo "sources:"; find src -name '*.swift'
+      - name: Compile + link watchOS app (arm64 + arm64_32, Apple toolchain)
+        env:
+          PRODUCT: ${{ inputs.product }}
+          EXT_PRODUCT: ${{ inputs.ext_product }}
+          DEPLOYMENT: ${{ inputs.deployment }}
+        run: |
+          set -eux
+          # App Store validation rejects arm64e for watchOS: it wants arm64 for every target plus
+          # arm64_32 whenever MinimumOSVersion is below 27.0. Build both and fuse them.
+          build() {
+            out=$1; shift
+            for ARCH in arm64 arm64_32; do
+              xcrun --sdk watchos swiftc \
+                -target $ARCH-apple-watchos$DEPLOYMENT \
+                -parse-as-library -O \
+                "$@" \
+                -Xlinker -rpath -Xlinker @executable_path/Frameworks \
+                -Xlinker -rpath -Xlinker @executable_path/../../Frameworks \
+                -o "$out.$ARCH"
+            done
+            xcrun lipo -create "$out.arm64" "$out.arm64_32" -output "$out"
+            xcrun lipo -info "$out"
+            file "$out"
+          }
+          build "$PRODUCT" $(find src -maxdepth 1 -name '*.swift')
+          # src/ext/ is the watch-face complication (a WidgetKit extension). It is its own
+          # executable with its own @main, so it must NOT share a link with the app.
+          if [ -n "$EXT_PRODUCT" ]; then
+            # An app extension's entry point is _NSExtensionMain, NOT the Swift @main's main
+            # (Xcode: LD_ENTRY_POINT = _NSExtensionMain for com.apple.product-type.app-extension).
+            # WidgetKit still finds the @main WidgetBundle through Swift protocol metadata. Enter at
+            # main instead and ExtensionFoundation traps (EXC_BREAKPOINT) the moment the main queue
+            # runs, so the widget never registers and no complication shows up in the gallery.
+            build "$EXT_PRODUCT" $(find src/ext -name '*.swift') \
+              -application-extension -Xlinker -e -Xlinker _NSExtensionMain
+          fi
+      - name: Icon fingerprint
+        id: icon
+        run: |
+          if [ -d src/AppIcon.xcassets ]; then
+            H=$(find src/AppIcon.xcassets -type f | sort | xargs shasum -a 256 | shasum -a 256 | cut -c1-40)
+            echo "custom=true" >> "$GITHUB_OUTPUT"
+            echo "hash=$H" >> "$GITHUB_OUTPUT"
+          else
+            echo "custom=false" >> "$GITHUB_OUTPUT"
+            echo "hash=placeholder" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Restore compiled icon (skip actool if the icon is unchanged)
+        if: steps.icon.outputs.custom == 'true'
+        uses: actions/cache@v4
+        with:
+          path: iconout
+          key: watch-icon-${{ steps.icon.outputs.hash }}
+      - name: App icon
+        run: |
+          mkdir -p out
+          if [ "${{ steps.icon.outputs.custom }}" = "true" ]; then
+            if [ -f iconout/Assets.car ]; then
+              echo "icon cache HIT (${{ steps.icon.outputs.hash }}) — skipping actool"
+            else
+              echo "icon changed — compiling with actool"
+              mkdir -p iconout
+              actool src/AppIcon.xcassets --compile iconout --platform watchos \
+                --minimum-deployment-target "${{ inputs.deployment }}" \
+                --app-icon AppIcon --output-partial-info-plist iconout/icon-info.plist
+            fi
+            cp iconout/Assets.car out/; cp iconout/icon-info.plist out/
+          else
+            # no custom icon — use the committed pre-compiled placeholder
+            cp prebuilt-icon/Assets.car out/; cp prebuilt-icon/icon-info.plist out/
+          fi
+          ls -la out
+      - name: Bundle outputs
+        env:
+          PRODUCT: ${{ inputs.product }}
+          EXT_PRODUCT: ${{ inputs.ext_product }}
+        run: |
+          mkdir -p bundle && mv "$PRODUCT" bundle/
+          if [ -n "$EXT_PRODUCT" ]; then mv "$EXT_PRODUCT" bundle/; fi
+          [ -f out/Assets.car ] && cp out/Assets.car bundle/ || true
+          [ -f out/icon-info.plist ] && cp out/icon-info.plist bundle/ || true
+          ls -la bundle
+      - name: Return built binary + assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-binary
+          path: bundle/
+          retention-days: 1
