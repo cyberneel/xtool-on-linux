@@ -12,6 +12,80 @@ I had to add around it to get widgets, Live Activities, an Apple Watch app, Siri
 
 Measured on a clean build of my own app (217.36 s).
 
+## From the reel: 3 steps
+
+The short version of what the reel shows: plain xtool, no Mac, a starter app on your iPhone. The
+widgets, Siri, the watch app and TestFlight are the rest of this repo.
+
+**The catch:** you still need an Apple account and Apple's Xcode download (the `.xip`). xtool
+pulls the iOS SDK out of that file. Xcode itself never runs.
+
+### 1. Install Swift and xtool (on Linux, once)
+
+- Swift: follow [swift.org/install/linux](https://swift.org/install/linux), then check it with
+  `swift --version`.
+- The iPhone's USB tools. On Ubuntu or Debian:
+
+  ```bash
+  sudo apt-get install usbmuxd libimobiledevice-utils
+  ```
+
+  On Arch, the package list is in [docs/SETUP.md](docs/SETUP.md).
+- xtool, one AppImage:
+
+  ```bash
+  curl -fL "https://github.com/xtool-org/xtool/releases/latest/download/xtool-$(uname -m).AppImage" -o xtool
+  chmod +x xtool
+  sudo mv xtool /usr/local/bin/
+  xtool --help      # OVERVIEW: Cross-platform Xcode replacement
+  ```
+
+- **On Windows:** do all of this inside WSL, and pass the iPhone through to it with usbipd. xtool's
+  [Linux and Windows install guide](https://github.com/xtool-org/xtool/blob/main/Documentation/xtool.docc/Installation-Linux.md)
+  covers both.
+
+### 2. Sign in and give xtool the SDK (once)
+
+1. In your browser, sign in at
+   [developer.apple.com/download/all](https://developer.apple.com/download/all/?q=Xcode) and
+   download Xcode's `.xip`. The page needs your login, so `curl` will not work. I used
+   `Xcode_26.6_Universal.xip`.
+2. Run the setup, pick a login mode, then give it the path to the `.xip`:
+
+   ```console
+   $ xtool setup
+   Select login mode
+   0: API Key (requires paid Apple Developer Program membership)
+   1: Password (works with any Apple ID but uses private APIs)
+   Choice (0-1): 0
+   ...
+   Path to Xcode.xip: ~/Downloads/Xcode_26.6_Universal.xip
+   ```
+
+   I use the API key, which needs the paid Apple Developer Program. The password mode goes through
+   Apple's private APIs, and xtool's guide suggests a spare Apple account for it. I have not tried it.
+
+### 3. Plug in your iPhone (every build)
+
+1. Turn on Developer Mode: **Settings › Privacy & Security › Developer Mode**. The phone restarts;
+   unlock it and confirm **Turn On**. If the switch is not there yet, do steps 2 and 3 once and
+   look again.
+2. Plug the phone into the Linux machine. Tap **Trust** on **Trust This Computer?** and enter your
+   passcode.
+3. Make an app and run it:
+
+   ```bash
+   xtool new Hello && cd Hello
+   xtool dev
+   ```
+
+   It builds, signs and installs Hello, and it appears on your home screen. If iOS says
+   **Untrusted Developer**, go to **Settings › General › VPN & Device Management**, tap your
+   account and trust it.
+
+From here, `ios-ota` in this repo does the same build with Siri, the watch app and an
+install-over-the-air page. See the [Quick start](#quick-start).
+
 ## What works
 
 | Feature | Status | Where it is built |
