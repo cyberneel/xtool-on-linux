@@ -128,6 +128,32 @@ Optional files next to `xtool.yml` (samples in [`example/`](../example)):
 | `ios-ota.watch.infoplist.json` | extra Info.plist keys for the watch app |
 | `ios-ota.watch.activities` | `ActivityAttributes` type names whose Live Activity should open the watch app |
 | `AppIntentVocabulary.plist` | SiriKit example phrases |
+| `ios-ota.xcconfig` | Xcode build settings, see [below](#xcode-build-settings-xcconfig) |
+
+### Xcode build settings (`.xcconfig`)
+
+An Xcode project's `.xcconfig` files and Info.plist work as they are. Put the settings in
+`ios-ota.xcconfig`, which can `#include` your existing files, or pass one with
+`ios-ota --xcconfig Config/Release.xcconfig .`. Dev builds use the `Debug` configuration;
+`--testflight` and `--both` use `Release`. That matters for lines like `KEY[config=Release] = ...`.
+
+What is applied:
+
+- **`$(VAR)` and `${VAR}`** in every Info.plist (the app, its extensions and the watch app) and in
+  the entitlements. This includes the settings Xcode defines itself: `PRODUCT_BUNDLE_IDENTIFIER`,
+  `EXECUTABLE_NAME`, `PRODUCT_NAME`, `CONFIGURATION`, `AppIdentifierPrefix` and
+  `TeamIdentifierPrefix`. A setting missing from the file falls back to an environment variable,
+  which is handy for secrets in CI. This part runs even without an `.xcconfig`.
+- **`INFOPLIST_KEY_<Key>`** sets that key in the app's Info.plist.
+- **`MARKETING_VERSION`** is the version. **`CURRENT_PROJECT_VERSION`** is the build number. Leave
+  the build number unset to keep the timestamp, because TestFlight needs it to go up on every upload.
+- **`PRODUCT_BUNDLE_IDENTIFIER`** replaces `bundleID` from `xtool.yml`. Keep the two equal if you
+  also use `xtool dev`.
+- **`CODE_SIGN_ENTITLEMENTS`** is merged into the app's entitlements, the same way as
+  `ios-ota.entitlements.json`. The profile still decides `aps-environment` and `get-task-allow`.
+
+Compiler settings such as `SWIFT_ACTIVE_COMPILATION_CONDITIONS` or `OTHER_SWIFT_FLAGS` are not
+applied. xtool compiles from `Package.swift`, so put those in its `swiftSettings`.
 
 Good to know:
 

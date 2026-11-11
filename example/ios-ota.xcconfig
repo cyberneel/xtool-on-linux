@@ -1,0 +1,10 @@
+// Xcode build settings for ios-ota. Optional; see docs/SETUP.md.
+// #include "Config/Shared.xcconfig"     // reuse an Xcode project's files
+
+MARKETING_VERSION = 1.4.0
+INFOPLIST_KEY_CFBundleDisplayName = My App
+
+// Read in the app with Bundle.main.object(forInfoDictionaryKey: "APIBaseURL"),
+// after adding APIBaseURL = $(API_BASE_URL) to App-Info.plist.
+API_BASE_URL = https:/$()/staging.example.com     // $() stops "//" from starting a comment
+API_BASE_URL[config=Release] = https:/$()/api.example.com

@@ -97,6 +97,7 @@ install-over-the-air page. See the [Quick start](#quick-start).
 | Apple Watch app | ✅ | compiled on a GitHub macOS runner, assembled and signed on Linux |
 | Watch-face complication | ⚠️ | builds and signs, not yet confirmed on a real watch face |
 | Install over the air or over USB | ✅ | Linux |
+| Xcode `.xcconfig` build settings and `$(VAR)`s in Info.plist | ✅ | Linux, [details](docs/SETUP.md#xcode-build-settings-xcconfig) |
 | TestFlight | ✅ | signed on Linux, uploaded by a GitHub macOS runner |
 
 "No Mac" means no Mac of your own. Three steps have no Linux equivalent and borrow a GitHub-hosted
@@ -144,6 +145,7 @@ That is the short version. The one-time setup (Swift, xtool, the SDK, signing id
 bin/
   ios-ota               the pipeline: build, Siri metadata, watch embed, sign, publish
   ios-testflight        same pipeline, distribution-signed, then uploaded
+  ios-xcconfig          applies Xcode .xcconfig build settings to the built app
   xtool-gen-appintents  runs the Siri generator against a built .app
   xtool-embed-watch     builds the watch app on CI and embeds it
   provision.py          signing certificates and profiles via the App Store Connect API

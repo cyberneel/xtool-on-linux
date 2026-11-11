@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Xcode .xcconfig build settings for an xtool build, applied the way Xcode applies them.
+
+  ios-xcconfig <file.xcconfig> <Debug|Release> get <KEY>         print one setting, expanded ('' if unset)
+  ios-xcconfig <file.xcconfig> <Debug|Release> info <Info.plist>  expand $(VAR) in every string, then apply
+                                                                  INFOPLIST_KEY_<Key> and MARKETING_VERSION
+  ios-xcconfig <file.xcconfig> <Debug|Release> expand <plist>     expand $(VAR) only (extensions, entitlements)
+  ios-xcconfig selftest
+
+A missing .xcconfig is fine: the settings Xcode always defines are still filled in from the bundle
+(PRODUCT_BUNDLE_IDENTIFIER, EXECUTABLE_NAME, PRODUCT_NAME, ...) or, for an entitlements plist, from the
+profile's application-identifier (AppIdentifierPrefix, TeamIdentifierPrefix). So an Info.plist or
+.entitlements file copied from an Xcode project works as is. Anything else unset falls back to the
+environment, as in xcodebuild, then to '' with a warning.
+
+Supported: // comments, #include / #include? "file", KEY[config=..][sdk=..][arch=..] conditions,
+$(inherited), $(VAR) and ${VAR} (nested too), and :default=, :lower, :upper, :rfc1034identifier,
+:c99extidentifier.
+"""
+import fnmatch, os, plistlib, re, sys
+
+OPS = {'lower': str.lower, 'upper': str.upper,
+       'rfc1034identifier': lambda v: re.sub(r'[^A-Za-z0-9.-]', '-', v),
+       'c99extidentifier': lambda v: re.sub(r'\W', '_', v)}
+REF = re.compile(r'\$\(([^()]*)\)|\$\{([^{}]*)\}')
+COND = {'sdk': 'iphoneos', 'arch': 'arm64'}   # ponytail: the watch app is matched as iphoneos too
+
+
+def load(path, config, s=None):
+    """Raw (unexpanded) settings. The last matching line wins, as in Xcode."""
+    s = {'CONFIGURATION': config, 'DEVELOPMENT_LANGUAGE': 'en'} if s is None else s
+    if not os.path.isfile(path):
+        return s
+    for line in open(path):
+        line = line.split('//', 1)[0].strip()      # xcconfig: // always starts a comment
+        if m := re.fullmatch(r'#include(\??)\s*"(.+)"', line):
+            inc = os.path.join(os.path.dirname(path), m[2])
+            if not m[1] and not os.path.isfile(inc):
+                print(f'warning: {path}: {m[2]} not found', file=sys.stderr)
+            load(inc, config, s)
+        elif m := re.fullmatch(r'(\w+)((?:\[[^]]*\])*)\s*=\s*(.*?);?', line):
+            env = {**COND, 'config': config}
+            if all(fnmatch.fnmatchcase(env.get(k, ''), v) for k, v in re.findall(r'(\w+)=([^],]*)', m[2])):
+                prev = s.get(m[1], '')
+                s[m[1]] = re.sub(r'\$[({]inherited[)}]', lambda _: prev, m[3].strip())
+    return s
+
+
+def expand(v, s, depth=0):
+    def ref(m):
+        name, *ops = (m[1] if m[1] is not None else m[2]).split(':')
+        val = s.get(name, os.environ.get(name))
+        if val is not None:
+            val = expand(val, s, depth + 1) if depth < 16 else ''
+        for op in ops:
+            if op.startswith('default='):
+                val = val or op[8:]
+            elif val is not None and op in OPS:
+                val = OPS[op](val)
+        if val is None:
+            if name:                                # $() is the empty escape, as in https:/$()/
+                print(f'warning: $({name}) is not set', file=sys.stderr)
+            return ''
+        return val
+    for _ in range(8):                              # inside-out, for $(A_$(CONFIGURATION))
+        v, n = REF.subn(ref, v)
+        if not n:
+            break
+    return v
+
+
+def walk(o, s):
+    if isinstance(o, str):
+        return expand(o, s)
+    if isinstance(o, list):
+        return [walk(x, s) for x in o]
+    if isinstance(o, dict):
+        return {k: walk(v, s) for k, v in o.items()}
+    return o
+
+
+def main(argv):
+    xc, config, verb, arg = argv
+    s = load(xc, config)
+    if verb == 'get':
+        return print(expand(s.get(arg, ''), s))
+    d = plistlib.load(open(arg, 'rb'))
+    name, ext = os.path.splitext(os.path.basename(os.path.dirname(os.path.abspath(arg))))
+    if ext in ('.app', '.appex'):                   # Info.plist: Xcode's per-target settings
+        s = {'PRODUCT_NAME': name, 'TARGET_NAME': name, 'PRODUCT_MODULE_NAME': OPS['c99extidentifier'](name),
+             **s, 'EXECUTABLE_NAME': name, 'PRODUCT_BUNDLE_PACKAGE_TYPE': 'XPC!' if ext == '.appex' else 'APPL'}
+        if '$' not in d.get('CFBundleIdentifier', '$'):
+            s['PRODUCT_BUNDLE_IDENTIFIER'] = d['CFBundleIdentifier']   # the ID it is signed with
+    if '.' in d.get('application-identifier', ''):  # entitlements: <AppIdentifierPrefix><bundle id>
+        prefix, _, bid = d['application-identifier'].partition('.')
+        s |= {'AppIdentifierPrefix': prefix + '.', 'PRODUCT_BUNDLE_IDENTIFIER': bid,
+              'TeamIdentifierPrefix': d.get('com.apple.developer.team-identifier', prefix) + '.'}
+    d = walk(d, s)
+    if verb == 'info':
+        # Build-setting keys beat xtool's defaults (CFBundleDisplayName, orientations, ...).
+        for k, v in s.items():
+            if k.startswith('INFOPLIST_KEY_') and not k.endswith('_Generation'):
+                key, v = k[14:], expand(v, s)
+                # ponytail: YES/NO -> bool, space list only where the key is already an array
+                d[key] = {'YES': True, 'NO': False}.get(v, v.split() if isinstance(d.get(key), list) else v)
+        if 'MARKETING_VERSION' in s:
+            d['CFBundleShortVersionString'] = expand(s['MARKETING_VERSION'], s)
+    plistlib.dump(d, open(arg, 'wb'))
+
+
+def selftest():
+    import tempfile
+    t = tempfile.mkdtemp()
+    def w(n, text): open(os.path.join(t, n), 'w').write(text)
+    w('base.xcconfig', 'HOST = api.example.com\nFLAGS = a\n')
+    w('x.xcconfig', '\n'.join([
+        '#include "base.xcconfig"', '#include? "missing.xcconfig"',
+        'URL = https:/$()/$(HOST)/v1   // comment', 'URL[config=Release] = https:/$()/prod.example.com;',
+        'FLAGS = $(inherited) b', 'ENV_Debug = dev', 'ENV_Release = prod', 'MARKETING_VERSION = 2.1',
+        'INFOPLIST_KEY_CFBundleDisplayName = My $(PRODUCT_NAME)', 'INFOPLIST_KEY_UIRequiresFullScreen = YES',
+        'INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft']))
+    xc = os.path.join(t, 'x.xcconfig')
+    s, r = load(xc, 'Debug'), load(xc, 'Release')
+    assert expand('$(URL)', s) == 'https://api.example.com/v1', expand('$(URL)', s)
+    assert expand('$(URL)', r) == 'https://prod.example.com'
+    assert expand('$(FLAGS) $(ENV_$(CONFIGURATION))', s) == 'a b dev'
+    assert expand('${NOPE:default=x}.$(HOST:upper)', s) == 'x.API.EXAMPLE.COM'
+    os.mkdir(os.path.join(t, 'My App.app'))
+    info = os.path.join(t, 'My App.app', 'Info.plist')
+    plistlib.dump({'CFBundleIdentifier': 'XTL-1.com.x', 'CFBundleExecutable': '$(EXECUTABLE_NAME)',
+                   'UISupportedInterfaceOrientations': ['UIInterfaceOrientationPortrait'],
+                   'Tasks': ['$(PRODUCT_BUNDLE_IDENTIFIER).refresh'], 'API': '$(URL)'}, open(info, 'wb'))
+    main([xc, 'Debug', 'info', info])
+    d = plistlib.load(open(info, 'rb'))
+    assert d['CFBundleExecutable'] == 'My App' and d['Tasks'] == ['XTL-1.com.x.refresh'], d
+    assert d['CFBundleDisplayName'] == 'My My App' and d['UIRequiresFullScreen'] is True, d
+    assert d['CFBundleShortVersionString'] == '2.1' and len(d['UISupportedInterfaceOrientations']) == 2, d
+    ent = os.path.join(t, 'ent.plist')
+    plistlib.dump({'application-identifier': 'ABC123.XTL-1.com.x', 'com.apple.developer.team-identifier': 'ABC123',
+                   'keychain-access-groups': ['$(AppIdentifierPrefix)shared']}, open(ent, 'wb'))
+    main([xc, 'Debug', 'expand', ent])
+    assert plistlib.load(open(ent, 'rb'))['keychain-access-groups'] == ['ABC123.shared']
+    print('ok')
+
+
+if __name__ == '__main__':
+    selftest() if sys.argv[1:] == ['selftest'] else main(sys.argv[1:])

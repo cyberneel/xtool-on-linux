@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build, sign, and publish an xtool project for OTA install via tailnet.
-# Usage: ios-ota [--testflight|--both] [project-dir]     (defaults to current directory)
+# Usage: ios-ota [--testflight|--both] [--xcconfig FILE] [project-dir]     (defaults to current directory)
 #
+# Build settings: <project>/ios-ota.xcconfig, or --xcconfig FILE (Debug for dev, Release otherwise; see
+# ios-xcconfig). $(VAR) references in Info.plists and entitlements are expanded with or without one.
 # --testflight signs with the DISTRIBUTION identity + App Store profiles (no device list,
 # get-task-allow off) and uploads to App Store Connect instead of publishing an OTA page.
 # --both signs the one compile twice: publishes the OTA page, then uploads the TestFlight copy.
@@ -17,15 +19,27 @@ if [ -z "${USBMUXD_SOCKET_ADDRESS:-}" ]; then
   if [ -n "$_H" ]; then export USBMUXD_SOCKET_ADDRESS="$_H"; fi
 fi
 
-MODE=dev
-case "${1:-}" in --testflight) MODE=testflight; shift ;; --both) MODE=both; shift ;; esac
+MODE=dev XCCONFIG=
+while :; do case "${1:-}" in
+  --testflight) MODE=testflight; shift ;;
+  --both) MODE=both; shift ;;
+  --xcconfig) XCCONFIG=$(realpath -e "$2"); shift 2 ;;
+  *) break ;;
+esac; done
 
 PROJ=$(realpath "${1:-.}")
 STORE=~/.local/share/ios-ota
 WWW=$STORE/www
 [ -f "$PROJ/xtool.yml" ] || { echo "error: $PROJ is not an xtool project (no xtool.yml)"; exit 1; }
 
-BUNDLE=$(grep -E '^bundleID:' "$PROJ/xtool.yml" | awk '{print $2}')
+XCCONFIG=${XCCONFIG:-$PROJ/ios-ota.xcconfig}
+CONFIG=Debug; [ "$MODE" = dev ] || CONFIG=Release   # --both is one compile, so it gets Release
+xc() { ios-xcconfig "$XCCONFIG" "$CONFIG" "$@"; }
+APP_ENT=$(xc get CODE_SIGN_ENTITLEMENTS)
+if [ -n "$APP_ENT" ]; then APP_ENT=$(cd "$PROJ" && realpath -e "$APP_ENT"); fi
+
+BUNDLE=$(xc get PRODUCT_BUNDLE_IDENTIFIER)
+[ -n "$BUNDLE" ] || BUNDLE=$(grep -E '^bundleID:' "$PROJ/xtool.yml" | awk '{print $2}')
 PREFIX=$(python3 -c "import json;print('XTL-'+json.load(open('$HOME/.config/xtool/data/XTLAuthToken'))['appStoreConnect']['_0']['issuerID'][:8].upper())")
 XTLID="$PREFIX.$BUNDLE"   # must match xtool's device-install ID so OTA updates preserve app data
 
@@ -42,19 +56,26 @@ APPNAME=$(basename "$APP" .app)
 APP_ORIG_BID=$(python3 -c "import plistlib;print(plistlib.load(open('$APP/Info.plist','rb'))['CFBundleIdentifier'])")
 
 # Extract the Entitlements dict out of a .mobileprovision into a plist file, optionally
-# merging a per-project ios-ota.entitlements.json (3rd arg). keychain-access-groups are
+# merging a per-project ios-ota.entitlements.json and/or an Xcode .entitlements plist (3rd+ args).
+# keychain-access-groups are
 # APPENDED (the profile's TEAMID.* wildcard authorizes concrete groups, but iOS only matches
 # the literal group named in the signed entitlement — Xcode bakes it in; we do the same so an
-# appex can share a keychain group with the app). Other keys are set outright.
-extract_ent() { python3 - "$1" "$2" "${3:-}" <<'EOF'
+# appex can share a keychain group with the app). Other keys are set outright, except that an
+# Xcode .entitlements file never overrides what the profile decides (Xcode does the same on export:
+# its file says aps-environment=development even for an App Store build). $(VAR)s are then expanded.
+extract_ent() { python3 - "$@" <<'EOF'
 import plistlib, sys, json, os
-prof, out = sys.argv[1], sys.argv[2]
-cfg = sys.argv[3] if len(sys.argv) > 3 else ''
+prof, out, *cfgs = sys.argv[1:]
 raw = open(prof, 'rb').read()
 plist = raw[raw.find(b'<?xml'):raw.find(b'</plist>') + 8]
 ent = plistlib.loads(plist)['Entitlements']
-if cfg and os.path.exists(cfg):
-    for k, v in json.load(open(cfg)).items():
+PROFILE_OWNED = {'application-identifier', 'com.apple.developer.team-identifier', 'aps-environment', 'get-task-allow'}
+for cfg in cfgs:
+    if not os.path.isfile(cfg): continue
+    xcode = not cfg.endswith('.json')
+    for k, v in (plistlib.load(open(cfg, 'rb')) if xcode else json.load(open(cfg))).items():
+        if xcode and k in PROFILE_OWNED:
+            continue
         if v is None:                       # null → REMOVE the key (e.g. drop an unwanted profile entitlement)
             ent.pop(k, None)
         elif k == 'keychain-access-groups' and isinstance(v, list):
@@ -64,6 +85,7 @@ if cfg and os.path.exists(cfg):
             ent[k] = v
 plistlib.dump(ent, open(out, 'wb'))
 EOF
+xc expand "$2"
 }
 
 # App Store validation rejects a build whose Info.plist lacks the toolchain-provenance keys Xcode
@@ -103,7 +125,8 @@ EOF
 }
 
 echo "==> Rewriting bundle ID + bumping build number"
-BUILD=$(date +%Y%m%d%H%M%S)
+BUILD=$(xc get CURRENT_PROJECT_VERSION)
+[ -n "$BUILD" ] || BUILD=$(date +%Y%m%d%H%M%S)
 python3 - "$APP/Info.plist" "$XTLID" "$BUILD" "$PROJ/ios-ota.infoplist.json" <<'EOF'
 import plistlib, sys, json, os
 p, bid, build, extra = sys.argv[1:]
@@ -115,6 +138,7 @@ if os.path.exists(extra):
     d.update(json.load(open(extra)))
 plistlib.dump(d, open(p, 'wb'))
 EOF
+xc info "$APP/Info.plist"   # $(VAR)s, INFOPLIST_KEY_*, MARKETING_VERSION
 
 add_dt "$APP/Info.plist"
 
@@ -175,6 +199,7 @@ plistlib.dump(d, open(info, 'wb'))
 print(xtlid + suffix)
 EOF
 )
+  xc expand "$AX/Info.plist"
   add_dt "$AX/Info.plist"
   NESTED+=("$REL" "$AXNEW")
   echo "    $REL -> $AXNEW"
@@ -247,7 +272,7 @@ EOF
   local PROFILE=$STORE/profiles/$XTLID$suffix.mobileprovision
   [ -f "$PROFILE" ] || provision.py $prov "$XTLID"
   cp "$PROFILE" "$APP/embedded.mobileprovision"
-  extract_ent "$PROFILE" "$WORK/$m/ent.plist" "$PROJ/ios-ota.entitlements.json"
+  extract_ent "$PROFILE" "$WORK/$m/ent.plist" "$PROJ/ios-ota.entitlements.json" ${APP_ENT:+"$APP_ENT"}
   if [ "$m" = testflight ]; then strip_dev_ent "$WORK/$m/ent.plist"; fi
   # main entitlements apply to the app; SCOPE_ARGS override per-appex. rcodesign signs inner-first.
   rcodesign sign --pem-file $STORE/$key --pem-file $STORE/$cert \
